@@ -13,6 +13,7 @@ h2 { font-size: 15px; margin: 0 0 10px; }
 label { display: inline-block; width: 120px; font-size: 13px; }
 input { padding: 4px 6px; margin: 2px 0; font-size: 13px; }
 button { padding: 6px 14px; cursor: pointer; font-size: 13px; }
+button:disabled { cursor: not-allowed; opacity: .55; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { border: 1px solid #e0e0e0; padding: 3px 6px; text-align: left; vertical-align: top; }
 th { background: #f5f5f5; white-space: nowrap; }
@@ -21,7 +22,10 @@ th { background: #f5f5f5; white-space: nowrap; }
 pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 .pill { padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
 .st-active { background: #e7f5ff; } .st-closed { background: #ebfbee; } .st-error { background: #fff5f5; }
+.st-aborted { background: #fff0f6; color: #c2255c; }
+.m-draining { background: #fff9db; } .m-drained { background: #ebfbee; } .m-cancelled { background: #f1f3f5; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
+#maintCard.maint-on { border-color: #f08c00; background: #fffdf5; }
 </style>
 </head>
 <body>
@@ -35,7 +39,31 @@ pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-w
   <div><label>上行延迟 (ms)</label><input id="up_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">客户端 → 目标</span></div>
   <div><label>下行延迟 (ms)</label><input id="down_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">目标 → 客户端</span></div>
   <div style="margin-top:8px"><button id="saveBtn">保存配置</button> <span id="cfgStatus"></span></div>
-  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置，新配置只影响之后建立的连接；修改监听地址/端口会重启监听器（已有连接不受影响）。</div>
+  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置，新配置只影响之后建立的连接；修改监听地址/端口会重启监听器（已有连接不受影响）。维护期间改配置不会恢复接入。</div>
+</div>
+
+<div class="card" id="maintCard">
+  <h2>维护模式（值班工程师）</h2>
+  <div id="maintIdle">
+    <label>宽限期（秒）</label><input id="grace" type="number" min="1" max="60" step="1" value="10" style="width:90px">
+    <button id="startMaintBtn">进入维护（停收新连接）</button>
+    <div class="muted" style="margin-top:6px">1～60 秒。进入后立即拒绝新 TCP 连接与新试传（改配置不能绕过），已有连接按原配置继续传输；全部连接双向传输与清理完成才算排空，宽限期满则中止剩余连接。</div>
+  </div>
+  <div id="maintActive" style="display:none">
+    <div style="margin-bottom:8px">
+      <span class="pill m-draining" id="maintPill">维护中</span>
+      第 <b id="maintEpoch"></b> 轮 · 剩余连接 <b id="maintRemain"></b> / <span id="maintInitial"></span> 条 ·
+      宽限剩余 <b id="maintCountdown"></b> s ·
+      已拒新连接 <span id="maintRefusedTcp"></span> 个 / 新试传 <span id="maintRefusedUp"></span> 次
+    </div>
+    <button id="cancelMaintBtn">取消维护并恢复接入</button>
+    <span class="muted">取消后已有连接继续按原配置传输，旧期限不再生效。</span>
+  </div>
+  <div id="maintDone" style="display:none">
+    <div style="margin-bottom:8px"><span class="pill" id="maintDonePill"></span> <span id="maintDoneText"></span></div>
+    <button id="resumeBtn">恢复接入</button>
+  </div>
+  <div id="maintResultsWrap" style="margin-top:10px"></div>
 </div>
 
 <div class="card">
@@ -59,6 +87,8 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtNum = n => (n ?? 0).toLocaleString();
 const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "-";
+let uploading = false;
+let lastAccepting = true;
 
 async function loadConfig() {
   const r = await fetch("/api/config");
@@ -66,9 +96,16 @@ async function loadConfig() {
   const c = d.config;
   for (const k of ["listen_host","listen_port","target_host","target_port","up_delay_ms","down_delay_ms"])
     $(k).value = c[k];
-  $("cfgStatus").innerHTML = d.listening
-    ? `<span class="ok">● 监听中 ${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}</span>`
-    : `<span class="err">● 未监听：${esc(d.listen_error || "未启动")}</span>`;
+  renderCfgStatus(d);
+}
+
+function renderCfgStatus(d) {
+  const acc = d.accepting
+    ? `<span class="ok">接入正常</span>`
+    : `<span class="err">维护停收中（拒绝新连接/新试传）</span>`;
+  $("cfgStatus").innerHTML = (d.listening
+    ? `<span class="ok">● 监听中 ${esc(d.config.listen_host)}:${d.config.listen_port} → ${esc(d.config.target_host)}:${d.config.target_port}</span>`
+    : `<span class="err">● 未监听：${esc(d.listen_error || "未启动")}</span>`) + " · " + acc;
 }
 
 async function saveConfig() {
@@ -85,17 +122,91 @@ async function saveConfig() {
     const r = await fetch("/api/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
     const d = await r.json();
     if (!r.ok) throw new Error(JSON.stringify(d));
-    $("cfgStatus").innerHTML = d.listening
-      ? `<span class="ok">已保存，监听中 ${esc(d.config.listen_host)}:${d.config.listen_port} → ${esc(d.config.target_host)}:${d.config.target_port}</span>`
-      : `<span class="err">已保存，但监听失败：${esc(d.listen_error)}</span>`;
+    renderCfgStatus(d);
   } catch (e) {
     $("cfgStatus").innerHTML = `<span class="err">保存失败：${esc(e.message)}</span>`;
   }
 }
 
+const OUTCOME = {normal: ["正常结束", "ok"], aborted: ["维护中断", "err"], error: ["错误", "err"]};
+
+function maintResultsTable(m) {
+  if (!m || !m.results.length) return "";
+  const rows = m.results.map(r => {
+    const [txt, cls] = OUTCOME[r.outcome] || [r.outcome, ""];
+    return `<tr><td>${r.id}</td><td class="${cls}">${txt}</td><td>${esc(r.client)}</td>` +
+      `<td class="num">${fmtNum(r.up_bytes)}</td><td class="num">${fmtNum(r.down_bytes)}</td>` +
+      `<td>${r.saw_eof ? "✓" : "–"}</td><td>${esc(r.detail || "")}</td><td>${fmtTime(r.ended_at)}</td></tr>`;
+  }).join("");
+  return `<table><tr><th>连接ID</th><th>结果</th><th>客户端</th><th>上行字节</th><th>下行字节</th>` +
+    `<th>见过EOF</th><th>详情</th><th>结束时间</th></tr>${rows}</table>`;
+}
+
+function renderMaintenance(d) {
+  const m = d.maintenance;
+  const draining = m && m.state === "draining";
+  const done = m && m.state !== "draining" && !d.accepting;
+  $("maintCard").classList.toggle("maint-on", !!draining);
+  $("maintIdle").style.display = (!m || (m.state !== "draining" && d.accepting)) ? "" : "none";
+  $("maintActive").style.display = draining ? "" : "none";
+  $("maintDone").style.display = done ? "" : "none";
+  if (draining) {
+    $("maintEpoch").textContent = m.epoch;
+    $("maintRemain").textContent = m.remaining;
+    $("maintInitial").textContent = m.initial;
+    $("maintCountdown").textContent = m.remaining_s.toFixed(1);
+    $("maintRefusedTcp").textContent = m.refused_tcp;
+    $("maintRefusedUp").textContent = m.refused_uploads;
+  }
+  if (done) {
+    const pill = $("maintDonePill");
+    if (m.state === "drained") { pill.textContent = "已排空"; pill.className = "pill m-drained"; }
+    else { pill.textContent = "已取消"; pill.className = "pill m-cancelled"; }
+    $("maintDoneText").textContent =
+      `第 ${m.epoch} 轮维护${m.state === "drained" ? "已结束（全部连接清理完成）" : "已取消"}，` +
+      `共 ${m.results.length} 条连接有结果，当前仍停收，点击“恢复接入”重新接收新连接。`;
+  }
+  $("maintResultsWrap").innerHTML = m && m.results.length
+    ? `<h2>本轮连接结果（逐条区分正常结束 / 维护中断）</h2>${maintResultsTable(m)}` : "";
+  // 停收期间禁止新试传
+  lastAccepting = d.accepting;
+  $("upBtn").disabled = !d.accepting || uploading;
+  if (!d.accepting && !uploading)
+    $("upStatus").innerHTML = `<span class="err">维护中：新试传被拒绝</span>`;
+}
+
+async function maintAction(path, body) {
+  const opt = {method: "POST", headers: {"Content-Type": "application/json"}};
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+  return d;
+}
+
+async function startMaintenance() {
+  const grace = +$("grace").value;
+  if (!(grace >= 1 && grace <= 60)) { alert("宽限期须在 1～60 秒之间"); return; }
+  try { await maintAction("/api/maintenance/start", {grace_s: grace}); }
+  catch (e) { alert("进入维护失败：" + e.message); }
+  refresh();
+}
+
+async function cancelMaintenance() {
+  try { await maintAction("/api/maintenance/cancel"); }
+  catch (e) { alert("取消失败：" + e.message); }
+  refresh();
+}
+
+async function resumeAccess() {
+  try { await maintAction("/api/maintenance/resume"); }
+  catch (e) { alert("恢复失败：" + e.message); }
+  refresh();
+}
+
 const HEAD = `<tr><th>ID</th><th>状态</th><th>客户端</th><th>目标</th>` +
   `<th>上行字节</th><th>下行字节</th><th>上行缓冲<br>当前/峰值</th><th>下行缓冲<br>当前/峰值</th>` +
-  `<th>延迟ms<br>上/下</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
+  `<th>延迟ms<br>上/下</th><th>上行<br>EOF</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
 
 function connRow(c) {
   const receipt = (c.receipt || "").slice(-160);
@@ -105,6 +216,7 @@ function connRow(c) {
     `<td class="num">${fmtNum(c.up.queued)} / ${fmtNum(c.up.peak)}</td>` +
     `<td class="num">${fmtNum(c.down.queued)} / ${fmtNum(c.down.peak)}</td>` +
     `<td class="num">${c.up_delay_ms} / ${c.down_delay_ms}</td>` +
+    `<td>${c.saw_eof ? "✓" : "–"}</td>` +
     `<td>${esc(receipt)}</td><td>${fmtTime(c.started_at)}</td><td>${fmtTime(c.ended_at)}</td>` +
     `<td class="err">${esc(c.error || "")}</td></tr>`;
 }
@@ -113,6 +225,8 @@ async function refresh() {
   try {
     const r = await fetch("/api/connections");
     const d = await r.json();
+    renderMaintenance(d);
+    renderCfgStatus(d);
     $("activeCount").textContent = `(${d.active.length})`;
     $("activeWrap").innerHTML = d.active.length
       ? `<table>${HEAD}${d.active.map(connRow).join("")}</table>` : `<div class="muted">无</div>`;
@@ -124,6 +238,7 @@ async function refresh() {
 async function doUpload() {
   const f = $("file").files[0];
   if (!f) { alert("请先选择文件"); return; }
+  uploading = true;
   $("upBtn").disabled = true;
   $("upStatus").textContent = `试传中：${f.name}（${fmtNum(f.size)} 字节）…`;
   $("upResult").style.display = "none";
@@ -141,7 +256,8 @@ async function doUpload() {
   } catch (e) {
     $("upStatus").innerHTML = `<span class="err">请求失败：${esc(e.message)}</span>`;
   } finally {
-    $("upBtn").disabled = false;
+    uploading = false;
+    $("upBtn").disabled = !lastAccepting;
     refresh();
   }
 }
@@ -154,6 +270,9 @@ async function clearHistory() {
 $("saveBtn").onclick = saveConfig;
 $("upBtn").onclick = doUpload;
 $("clearBtn").onclick = clearHistory;
+$("startMaintBtn").onclick = startMaintenance;
+$("cancelMaintBtn").onclick = cancelMaintenance;
+$("resumeBtn").onclick = resumeAccess;
 loadConfig();
 refresh();
 setInterval(refresh, 1000);
