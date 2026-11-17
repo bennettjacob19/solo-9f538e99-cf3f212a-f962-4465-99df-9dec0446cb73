@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TCP 延迟代理 · 慢链路复现</title>
+<style>
+body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 24px auto; max-width: 1220px; color: #222; }
+h1 { font-size: 20px; margin-bottom: 4px; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+.sub { color: #666; font-size: 13px; margin-bottom: 16px; }
+.card { border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+label { display: inline-block; width: 120px; font-size: 13px; }
+input { padding: 4px 6px; margin: 2px 0; font-size: 13px; }
+button { padding: 6px 14px; cursor: pointer; font-size: 13px; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { border: 1px solid #e0e0e0; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #f5f5f5; white-space: nowrap; }
+.ok { color: #0a7d2c; } .err { color: #c00; }
+.muted { color: #777; font-size: 12px; }
+pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+.pill { padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
+.st-active { background: #e7f5ff; } .st-closed { background: #ebfbee; } .st-error { background: #fff5f5; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1>TCP 延迟代理 <span class="muted">慢链路下“上传结束却收不到回执”复现工具</span></h1>
+<div class="sub">延迟自代理读到字节起算，连续数据流水发送（不按块累加等待）；每向应用缓冲 ≤ 64 KiB，满则暂停该向读取；单向 EOF 先冲刷待发字节再转发半关闭，反向继续到结束。</div>
+
+<div class="card">
+  <h2>代理配置</h2>
+  <div><label>监听地址</label><input id="listen_host" size="14"> : <input id="listen_port" type="number" style="width:90px"></div>
+  <div><label>目标地址</label><input id="target_host" size="14"> : <input id="target_port" type="number" style="width:90px"></div>
+  <div><label>上行延迟 (ms)</label><input id="up_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">客户端 → 目标</span></div>
+  <div><label>下行延迟 (ms)</label><input id="down_delay_ms" type="number" min="0" style="width:110px"> <span class="muted">目标 → 客户端</span></div>
+  <div style="margin-top:8px"><button id="saveBtn">保存配置</button> <span id="cfgStatus"></span></div>
+  <div class="muted" style="margin-top:6px">每条连接沿用建立时的配置，新配置只影响之后建立的连接；修改监听地址/端口会重启监听器（已有连接不受影响）。</div>
+</div>
+
+<div class="card">
+  <h2>上传试传（浏览器 → 本服务 → 经延迟代理 → 目标，读取回执）</h2>
+  <input type="file" id="file"> <button id="upBtn">开始试传</button> <span id="upStatus"></span>
+  <pre id="upResult" style="display:none"></pre>
+</div>
+
+<div class="card">
+  <h2>活动连接 <span class="muted" id="activeCount"></span></h2>
+  <div id="activeWrap"></div>
+</div>
+
+<div class="card">
+  <h2>历史连接 <button id="clearBtn" style="float:right">清空历史</button></h2>
+  <div id="histWrap"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtNum = n => (n ?? 0).toLocaleString();
+const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "-";
+
+async function loadConfig() {
+  const r = await fetch("/api/config");
+  const d = await r.json();
+  const c = d.config;
+  for (const k of ["listen_host","listen_port","target_host","target_port","up_delay_ms","down_delay_ms"])
+    $(k).value = c[k];
+  $("cfgStatus").innerHTML = d.listening
+    ? `<span class="ok">● 监听中 ${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}</span>`
+    : `<span class="err">● 未监听：${esc(d.listen_error || "未启动")}</span>`;
+}
+
+async function saveConfig() {
+  const body = {
+    listen_host: $("listen_host").value.trim(),
+    listen_port: +$("listen_port").value,
+    target_host: $("target_host").value.trim(),
+    target_port: +$("target_port").value,
+    up_delay_ms: +$("up_delay_ms").value,
+    down_delay_ms: +$("down_delay_ms").value,
+  };
+  $("cfgStatus").textContent = "保存中…";
+  try {
+    const r = await fetch("/api/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if (!r.ok) throw new Error(JSON.stringify(d));
+    $("cfgStatus").innerHTML = d.listening
+      ? `<span class="ok">已保存，监听中 ${esc(d.config.listen_host)}:${d.config.listen_port} → ${esc(d.config.target_host)}:${d.config.target_port}</span>`
+      : `<span class="err">已保存，但监听失败：${esc(d.listen_error)}</span>`;
+  } catch (e) {
+    $("cfgStatus").innerHTML = `<span class="err">保存失败：${esc(e.message)}</span>`;
+  }
+}
+
+const HEAD = `<tr><th>ID</th><th>状态</th><th>客户端</th><th>目标</th>` +
+  `<th>上行字节</th><th>下行字节</th><th>上行缓冲<br>当前/峰值</th><th>下行缓冲<br>当前/峰值</th>` +
+  `<th>延迟ms<br>上/下</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
+
+function connRow(c) {
+  const receipt = (c.receipt || "").slice(-160);
+  return `<tr><td>${c.id}</td><td><span class="pill st-${c.state}">${c.state}</span></td>` +
+    `<td>${esc(c.client)}</td><td>${esc(c.target)}</td>` +
+    `<td class="num">${fmtNum(c.up.bytes)}</td><td class="num">${fmtNum(c.down.bytes)}</td>` +
+    `<td class="num">${fmtNum(c.up.queued)} / ${fmtNum(c.up.peak)}</td>` +
+    `<td class="num">${fmtNum(c.down.queued)} / ${fmtNum(c.down.peak)}</td>` +
+    `<td class="num">${c.up_delay_ms} / ${c.down_delay_ms}</td>` +
+    `<td>${esc(receipt)}</td><td>${fmtTime(c.started_at)}</td><td>${fmtTime(c.ended_at)}</td>` +
+    `<td class="err">${esc(c.error || "")}</td></tr>`;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/connections");
+    const d = await r.json();
+    $("activeCount").textContent = `(${d.active.length})`;
+    $("activeWrap").innerHTML = d.active.length
+      ? `<table>${HEAD}${d.active.map(connRow).join("")}</table>` : `<div class="muted">无</div>`;
+    $("histWrap").innerHTML = d.history.length
+      ? `<table>${HEAD}${d.history.map(connRow).join("")}</table>` : `<div class="muted">无</div>`;
+  } catch (e) { /* 下次刷新重试 */ }
+}
+
+async function doUpload() {
+  const f = $("file").files[0];
+  if (!f) { alert("请先选择文件"); return; }
+  $("upBtn").disabled = true;
+  $("upStatus").textContent = `试传中：${f.name}（${fmtNum(f.size)} 字节）…`;
+  $("upResult").style.display = "none";
+  try {
+    const fd = new FormData();
+    fd.append("file", f, f.name);
+    const r = await fetch("/api/test-upload", {method: "POST", body: fd});
+    const d = await r.json();
+    const el = $("upResult");
+    el.style.display = "block";
+    el.textContent = JSON.stringify(d, null, 2);
+    $("upStatus").innerHTML = d.ok
+      ? `<span class="ok">完成：${fmtNum(d.bytes_sent)} 字节，${d.duration_ms} ms，回执：${esc(d.receipt || "")}</span>`
+      : `<span class="err">失败：${esc(d.error || ("HTTP " + r.status))}</span>`;
+  } catch (e) {
+    $("upStatus").innerHTML = `<span class="err">请求失败：${esc(e.message)}</span>`;
+  } finally {
+    $("upBtn").disabled = false;
+    refresh();
+  }
+}
+
+async function clearHistory() {
+  await fetch("/api/history/clear", {method: "POST"});
+  refresh();
+}
+
+$("saveBtn").onclick = saveConfig;
+$("upBtn").onclick = doUpload;
+$("clearBtn").onclick = clearHistory;
+loadConfig();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

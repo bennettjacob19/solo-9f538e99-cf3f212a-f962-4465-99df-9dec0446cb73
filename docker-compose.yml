@@ -1,0 +1,22 @@
+services:
+  receiver:
+    build: ./receiver
+    environment:
+      PORT: "9000"
+    expose:
+      - "9000"
+
+  proxy:
+    build: ./proxy
+    environment:
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "7000"        # TCP 延迟代理监听端口
+      TARGET_HOST: receiver      # 目标地址（可在网页上改）
+      TARGET_PORT: "9000"
+      UP_DELAY_MS: "300"         # 上行延迟：客户端 -> 目标
+      DOWN_DELAY_MS: "300"       # 下行延迟：目标 -> 客户端
+    ports:
+      - "8000:8000"              # 网页 / API
+      - "7000:7000"              # TCP 延迟代理（可直接对接设备/客户端）
+    depends_on:
+      - receiver
